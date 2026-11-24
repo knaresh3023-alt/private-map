@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Private Map</string>
+    <string name="service_name">Private Map Auto Search</string>
+    <string name="service_desc">Reads the drop address from Rapido and Porter popups and shows it on the map.</string>
+</resources>

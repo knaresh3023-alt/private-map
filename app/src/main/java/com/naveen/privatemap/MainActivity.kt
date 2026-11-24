@@ -3,6 +3,7 @@ package com.naveen.privatemap
 import android.Manifest
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -10,7 +11,9 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.drawable.GradientDrawable
 import android.location.Location
+import android.location.LocationManager
 import android.os.Bundle
+import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.inputmethod.EditorInfo
@@ -23,38 +26,31 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
-import org.json.JSONArray
-import org.json.JSONObject
 import org.osmdroid.config.Configuration
-import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.tileprovider.tilesource.XYTileSource
+import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.CustomZoomButtonsController
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Polyline
 import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
 
-data class Place(val title: String, val sub: String, val lat: Double, val lon: Double)
-
-class MainActivity : Activity() {
+class MainActivity : Activity(), DropListener {
 
     private lateinit var map: MapView
     private lateinit var myLoc: MyLocationNewOverlay
     private lateinit var input: EditText
     private lateinit var list: ListView
     private lateinit var status: TextView
+    private lateinit var autoBtn: Button
     private var destMarker: Marker? = null
+    private var routeLine: Polyline? = null
     private val results = ArrayList<Place>()
-
-    // Tamil Nadu box: lon min, lat min, lon max, lat max
-    private val tnWest = 76.2
-    private val tnSouth = 8.0
-    private val tnEast = 80.4
-    private val tnNorth = 13.6
+    private var token = 0
+    private var autoActive = false
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -68,16 +64,27 @@ class MainActivity : Activity() {
 
         val root = FrameLayout(this)
 
-        // ---- Map ----
+        // ---- Map (CARTO Voyager style, looks like Google Maps) ----
         map = MapView(this)
-        map.setTileSource(TileSourceFactory.MAPNIK)
+        val voyager = XYTileSource(
+            "CartoVoyager", 0, 19, 256, ".png",
+            arrayOf(
+                "https://a.basemaps.cartocdn.com/rastertiles/voyager/",
+                "https://b.basemaps.cartocdn.com/rastertiles/voyager/",
+                "https://c.basemaps.cartocdn.com/rastertiles/voyager/",
+                "https://d.basemaps.cartocdn.com/rastertiles/voyager/"
+            )
+        )
+        map.setTileSource(voyager)
+        map.isTilesScaledToDpi = true
         map.setMultiTouchControls(true)
+        map.keepScreenOn = true
         map.zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
         map.controller.setZoom(7.0)
         map.controller.setCenter(GeoPoint(11.1271, 78.6569))
         root.addView(map, FrameLayout.LayoutParams(-1, -1))
 
-        // ---- Blue dot (my location) ----
+        // ---- Blue dot ----
         myLoc = MyLocationNewOverlay(GpsMyLocationProvider(this), map)
         val dot = blueDot()
         myLoc.setPersonIcon(dot)
@@ -122,7 +129,7 @@ class MainActivity : Activity() {
         pLp.setMargins(dp(10), dp(10), dp(10), 0)
         root.addView(panel, pLp)
 
-        // ---- My location button (bottom right) ----
+        // ---- My location button ----
         val locBtn = Button(this)
         locBtn.text = "My location"
         val bLp = FrameLayout.LayoutParams(-2, -2)
@@ -130,9 +137,32 @@ class MainActivity : Activity() {
         bLp.setMargins(0, 0, dp(14), dp(24))
         root.addView(locBtn, bLp)
 
+        // ---- Auto search OFF warning ----
+        autoBtn = Button(this)
+        autoBtn.text = "Auto search is OFF - tap to turn ON"
+        autoBtn.setTextColor(Color.WHITE)
+        val ab = GradientDrawable()
+        ab.setColor(Color.rgb(200, 40, 40))
+        ab.cornerRadius = dp(8).toFloat()
+        autoBtn.background = ab
+        autoBtn.visibility = View.GONE
+        val aLp = FrameLayout.LayoutParams(-2, -2)
+        aLp.gravity = Gravity.BOTTOM or Gravity.START
+        aLp.setMargins(dp(14), 0, 0, dp(24))
+        root.addView(autoBtn, aLp)
+
+        // ---- Map credit ----
+        val credit = TextView(this)
+        credit.text = "\u00A9 OpenStreetMap \u00A9 CARTO"
+        credit.textSize = 9f
+        credit.setTextColor(Color.DKGRAY)
+        val cLp = FrameLayout.LayoutParams(-2, -2)
+        cLp.gravity = Gravity.BOTTOM or Gravity.START
+        cLp.setMargins(dp(4), 0, 0, dp(2))
+        root.addView(credit, cLp)
+
         setContentView(root)
 
-        // ---- Actions ----
         go.setOnClickListener { doSearch(input.text.toString()) }
         input.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_SEARCH) {
@@ -140,9 +170,16 @@ class MainActivity : Activity() {
             } else false
         }
         list.setOnItemClickListener { _, _, pos, _ ->
-            if (pos in results.indices) showDestination(results[pos])
+            if (pos in results.indices) {
+                token++
+                autoActive = false
+                showDestination(results[pos], false)
+            }
         }
         locBtn.setOnClickListener { goToMyLocation() }
+        autoBtn.setOnClickListener {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
 
         if (hasLocationPermission()) startLocation()
         else requestPermissions(
@@ -166,12 +203,27 @@ class MainActivity : Activity() {
         myLoc.enableMyLocation()
         myLoc.runOnFirstFix {
             runOnUiThread {
-                val p = myLoc.myLocation
-                if (p != null) {
-                    map.controller.setZoom(16.0)
-                    map.controller.animateTo(p)
+                if (destMarker == null) {
+                    val p = myLoc.myLocation
+                    if (p != null) {
+                        map.controller.setZoom(16.0)
+                        map.controller.animateTo(p)
+                    }
                 }
             }
+        }
+    }
+
+    private fun myPoint(): GeoPoint? {
+        myLoc.myLocation?.let { return it }
+        if (!hasLocationPermission()) return null
+        return try {
+            val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            val l: Location? = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                ?: lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+            if (l != null) GeoPoint(l.latitude, l.longitude) else null
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -180,7 +232,7 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Allow location permission first", Toast.LENGTH_LONG).show()
             return
         }
-        val p = myLoc.myLocation
+        val p = myPoint()
         if (p == null) {
             Toast.makeText(this, "Finding your location... wait a little", Toast.LENGTH_SHORT).show()
             startLocation()
@@ -204,7 +256,47 @@ class MainActivity : Activity() {
         return bmp
     }
 
-    // ---------------- Search ----------------
+    // ---------------- Auto search from popup ----------------
+
+    override fun onDrop(d: Drop) {
+        token++
+        val my = token
+        clearResult()
+        autoActive = true
+        list.visibility = View.GONE
+        status.visibility = View.GONE
+        input.setText(if (d.address.isNotEmpty()) d.address else d.area)
+        val me = myPoint()
+        Thread {
+            val place = try { Search.find(d, me) } catch (e: Exception) { null }
+            runOnUiThread {
+                if (place != null && my == token) showDestination(place, true)
+            }
+        }.start()
+    }
+
+    override fun onPopupGone() {
+        token++
+        if (!autoActive) return
+        autoActive = false
+        clearResult()
+        input.setText("")
+        val me = myPoint()
+        if (me != null) {
+            map.controller.setZoom(16.0)
+            map.controller.animateTo(me)
+        }
+    }
+
+    private fun clearResult() {
+        destMarker?.let { map.overlays.remove(it) }
+        destMarker = null
+        routeLine?.let { map.overlays.remove(it) }
+        routeLine = null
+        map.invalidate()
+    }
+
+    // ---------------- Manual search ----------------
 
     private fun doSearch(q: String) {
         val query = q.trim()
@@ -214,12 +306,12 @@ class MainActivity : Activity() {
         status.text = "Searching..."
         status.visibility = View.VISIBLE
         list.visibility = View.GONE
-        val me = myLoc.myLocation
+        val me = myPoint()
         Thread {
             var found: List<Place> = emptyList()
-            try { found = searchPhoton(query, me) } catch (e: Exception) { }
+            try { found = Search.photon(query, me) } catch (e: Exception) { }
             if (found.isEmpty()) {
-                try { found = searchNominatim(query) } catch (e: Exception) { }
+                try { found = Search.nominatim(query) } catch (e: Exception) { }
             }
             runOnUiThread { showResults(found, me) }
         }.start()
@@ -247,80 +339,101 @@ class MainActivity : Activity() {
         list.visibility = View.VISIBLE
     }
 
-    private fun showDestination(p: Place) {
-        destMarker?.let { map.overlays.remove(it) }
+    // ---------------- Pin + route ----------------
+
+    private fun showDestination(p: Place, auto: Boolean) {
+        clearResult()
+        val pos = GeoPoint(p.lat, p.lon)
         val m = Marker(map)
-        m.position = GeoPoint(p.lat, p.lon)
+        m.position = pos
         m.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-        m.title = p.title
-        m.snippet = p.sub
+        if (!auto) {
+            m.title = p.title
+            m.snippet = p.sub
+        }
         map.overlays.add(m)
         destMarker = m
-        m.showInfoWindow()
-        map.controller.setZoom(16.0)
-        map.controller.animateTo(m.position)
+        if (!auto) m.showInfoWindow()
         list.visibility = View.GONE
+
+        val me = myPoint()
+        if (me != null) {
+            drawRoute(me, pos, token)
+            if (auto) fitBelowPopup(me, pos) else fitAll(me, pos)
+        } else {
+            map.controller.setZoom(if (p.approx) 14.0 else 16.0)
+            map.controller.animateTo(pos)
+        }
         map.invalidate()
     }
 
-    private fun httpGet(url: String): String {
-        val c = URL(url).openConnection() as HttpURLConnection
-        c.connectTimeout = 8000
-        c.readTimeout = 8000
-        c.setRequestProperty("User-Agent", "PrivateMapNaveen/1.0 (personal use)")
-        try {
-            return c.inputStream.bufferedReader().use { it.readText() }
-        } finally {
-            c.disconnect()
-        }
+    private fun drawRoute(a: GeoPoint, b: GeoPoint, my: Int) {
+        val line = Polyline()
+        line.outlinePaint.color = Color.rgb(26, 115, 232)
+        line.outlinePaint.strokeWidth = dp(5).toFloat()
+        line.outlinePaint.strokeCap = Paint.Cap.ROUND
+        line.setPoints(listOf(a, b)) // straight line first (instant)
+        map.overlays.add(0, line)
+        routeLine = line
+        Thread {
+            val pts = try { Search.route(a, b) } catch (e: Exception) { null }
+            if (pts != null) {
+                runOnUiThread {
+                    if (my == token && routeLine === line) {
+                        line.setPoints(pts)
+                        map.invalidate()
+                    }
+                }
+            }
+        }.start()
     }
 
-    private fun searchPhoton(q: String, me: GeoPoint?): List<Place> {
-        var url = "https://photon.komoot.io/api/?limit=8&bbox=$tnWest,$tnSouth,$tnEast,$tnNorth&q=" +
-                URLEncoder.encode(q, "UTF-8")
-        if (me != null) url += "&lat=${me.latitude}&lon=${me.longitude}"
-        val feats = JSONObject(httpGet(url)).getJSONArray("features")
-        val out = ArrayList<Place>()
-        for (i in 0 until feats.length()) {
-            val f = feats.getJSONObject(i)
-            val co = f.getJSONObject("geometry").getJSONArray("coordinates")
-            val pr = f.getJSONObject("properties")
-            val lon = co.getDouble(0)
-            val lat = co.getDouble(1)
-            if (lat < tnSouth || lat > tnNorth || lon < tnWest || lon > tnEast) continue
-            val name = pr.optString("name", "")
-            val street = pr.optString("street", "")
-            val parts = listOf(street, pr.optString("district", ""), pr.optString("city", ""), pr.optString("state", ""))
-                .filter { it.isNotEmpty() && it != name }.distinct()
-            val title = if (name.isNotEmpty()) name else if (street.isNotEmpty()) street else "Place"
-            out.add(Place(title, parts.joinToString(", "), lat, lon))
-        }
-        return out
+    // Show both points in the LOWER half of the screen (popup covers the top)
+    private fun fitBelowPopup(a: GeoPoint, b: GeoPoint) {
+        val n = maxOf(a.latitude, b.latitude)
+        val s = minOf(a.latitude, b.latitude)
+        val e = maxOf(a.longitude, b.longitude)
+        val w = minOf(a.longitude, b.longitude)
+        val span = maxOf(n - s, 0.004)
+        val lonSpan = maxOf(e - w, 0.004)
+        val south = s - span * 0.15
+        val north = south + (span * 1.3) / 0.5
+        val west = w - lonSpan * 0.15
+        val east = e + lonSpan * 0.15
+        map.post { map.zoomToBoundingBox(BoundingBox(north, east, south, west), false) }
     }
 
-    private fun searchNominatim(q: String): List<Place> {
-        val url = "https://nominatim.openstreetmap.org/search?format=json&limit=8&countrycodes=in" +
-                "&bounded=1&viewbox=$tnWest,$tnNorth,$tnEast,$tnSouth&q=" + URLEncoder.encode(q, "UTF-8")
-        val arr = JSONArray(httpGet(url))
-        val out = ArrayList<Place>()
-        for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            val full = o.optString("display_name", "")
-            val title = full.substringBefore(",").ifEmpty { "Place" }
-            val sub = full.substringAfter(",", "").trim()
-            out.add(Place(title, sub, o.getDouble("lat"), o.getDouble("lon")))
-        }
-        return out
+    private fun fitAll(a: GeoPoint, b: GeoPoint) {
+        val n = maxOf(a.latitude, b.latitude)
+        val s = minOf(a.latitude, b.latitude)
+        val e = maxOf(a.longitude, b.longitude)
+        val w = minOf(a.longitude, b.longitude)
+        val span = maxOf(n - s, 0.004)
+        val lonSpan = maxOf(e - w, 0.004)
+        val box = BoundingBox(n + span * 0.3, e + lonSpan * 0.3, s - span * 0.3, w - lonSpan * 0.3)
+        map.post { map.zoomToBoundingBox(box, false) }
+    }
+
+    // ---------------- Lifecycle ----------------
+
+    private fun accessibilityOn(): Boolean {
+        val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+            ?: return false
+        return s.contains("$packageName/")
     }
 
     override fun onResume() {
         super.onResume()
         map.onResume()
         if (hasLocationPermission()) myLoc.enableMyLocation()
+        autoBtn.visibility = if (accessibilityOn()) View.GONE else View.VISIBLE
+        Bus.resetFlag = true
+        Bus.listener = this
     }
 
     override fun onPause() {
         super.onPause()
+        Bus.listener = null
         myLoc.disableMyLocation()
         map.onPause()
     }
