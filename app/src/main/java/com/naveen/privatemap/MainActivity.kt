@@ -24,10 +24,18 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.RadioButton
+import android.widget.RadioGroup
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import org.osmdroid.config.Configuration
-import org.osmdroid.tileprovider.tilesource.XYTileSource
+import org.osmdroid.tileprovider.MapTileProviderBasic
+import org.osmdroid.tileprovider.tilesource.ITileSource
+import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.MapTileIndex
+import org.osmdroid.views.overlay.TilesOverlay
 import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.CustomZoomButtonsController
@@ -52,6 +60,72 @@ class MainActivity : Activity(), DropListener {
     private var token = 0
     private var autoActive = false
 
+    private class Theme(
+        val name: String,
+        val base: ITileSource,
+        val ref: ITileSource?,
+        val sat: Boolean,
+        val credit: String
+    )
+
+    private lateinit var themes: List<Theme>
+    private lateinit var settings: LinearLayout
+    private lateinit var creditView: TextView
+    private lateinit var sizeLabel: TextView
+    private var refOverlay: TilesOverlay? = null
+    private var themeIdx = 0
+    private var sizePct = 30 // 30 = 130%
+
+    private fun esri(name: String, service: String, maxZ: Int, ending: String): ITileSource =
+        object : OnlineTileSourceBase(
+            name, 0, maxZ, 256, ending,
+            arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/$service/MapServer/tile/")
+        ) {
+            override fun getTileURLString(pMapTileIndex: Long): String =
+                baseUrl + MapTileIndex.getZoom(pMapTileIndex) + "/" +
+                        MapTileIndex.getY(pMapTileIndex) + "/" + MapTileIndex.getX(pMapTileIndex)
+        }
+
+    private fun buildThemes(): List<Theme> = listOf(
+        Theme("Google-like (Esri Street)", esri("EsriStreet", "World_Street_Map", 19, ".jpg"), null, false, "\u00A9 Esri"),
+        Theme("OpenStreetMap", TileSourceFactory.MAPNIK, null, false, "\u00A9 OpenStreetMap"),
+        Theme("Light",
+            esri("EsriLightBase", "Canvas/World_Light_Gray_Base", 16, ".png"),
+            esri("EsriLightRef", "Canvas/World_Light_Gray_Reference", 16, ".png"), false, "\u00A9 Esri"),
+        Theme("Night",
+            esri("EsriDarkBase", "Canvas/World_Dark_Gray_Base", 16, ".png"),
+            esri("EsriDarkRef", "Canvas/World_Dark_Gray_Reference", 16, ".png"), false, "\u00A9 Esri"),
+        Theme("Satellite", esri("EsriSat", "World_Imagery", 19, ".jpg"), null, true, "\u00A9 Esri")
+    )
+
+    private fun factor(): Float = 1f + sizePct / 100f
+
+    private fun applyTheme() {
+        val t = themes[themeIdx]
+        refOverlay?.let {
+            map.overlays.remove(it)
+            it.onDetach(map)
+        }
+        refOverlay = null
+        map.setTileSource(t.base)
+        if (t.ref != null) {
+            val ov = TilesOverlay(MapTileProviderBasic(applicationContext, t.ref), this)
+            ov.loadingBackgroundColor = Color.TRANSPARENT
+            ov.loadingLineColor = Color.TRANSPARENT
+            map.overlays.add(0, ov)
+            refOverlay = ov
+        }
+        map.setTilesScaleFactor(if (t.sat) 1f else factor())
+        creditView.text = t.credit
+        map.invalidate()
+    }
+
+    private fun routeIndex(): Int {
+        val r = refOverlay ?: return 0
+        val i = map.overlays.indexOf(r)
+        return if (i >= 0) i + 1 else 0
+    }
+
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -64,19 +138,14 @@ class MainActivity : Activity(), DropListener {
 
         val root = FrameLayout(this)
 
-        // ---- Map (CARTO Voyager style, looks like Google Maps) ----
+        val prefs = getSharedPreferences("pm", Context.MODE_PRIVATE)
+        themeIdx = prefs.getInt("theme", 0)
+        sizePct = prefs.getInt("size", 30)
+        themes = buildThemes()
+        if (themeIdx !in themes.indices) themeIdx = 0
+
+        // ---- Map ----
         map = MapView(this)
-        val voyager = XYTileSource(
-            "CartoVoyager", 0, 19, 256, ".png",
-            arrayOf(
-                "https://a.basemaps.cartocdn.com/rastertiles/voyager/",
-                "https://b.basemaps.cartocdn.com/rastertiles/voyager/",
-                "https://c.basemaps.cartocdn.com/rastertiles/voyager/",
-                "https://d.basemaps.cartocdn.com/rastertiles/voyager/"
-            )
-        )
-        map.setTileSource(voyager)
-        map.isTilesScaledToDpi = true
         map.setMultiTouchControls(true)
         map.keepScreenOn = true
         map.zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
@@ -105,13 +174,17 @@ class MainActivity : Activity(), DropListener {
 
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        val menuBtn = smallBtn("\u2630")
+        row.addView(menuBtn, LinearLayout.LayoutParams(-2, -2))
         input = EditText(this)
         input.hint = "Search destination"
         input.isSingleLine = true
         input.imeOptions = EditorInfo.IME_ACTION_SEARCH
         row.addView(input, LinearLayout.LayoutParams(0, -2, 1f))
-        val go = Button(this)
-        go.text = "Go"
+        val backBtn = smallBtn("Back")
+        row.addView(backBtn, LinearLayout.LayoutParams(-2, -2))
+        val go = smallBtn("Go")
         row.addView(go, LinearLayout.LayoutParams(-2, -2))
         panel.addView(row)
 
@@ -123,6 +196,67 @@ class MainActivity : Activity(), DropListener {
         list = ListView(this)
         list.visibility = View.GONE
         panel.addView(list, LinearLayout.LayoutParams(-1, dp(280)))
+
+        // ---- Settings (opens with the 3-line button) ----
+        settings = LinearLayout(this)
+        settings.orientation = LinearLayout.VERTICAL
+        settings.visibility = View.GONE
+        settings.setPadding(dp(6), dp(6), dp(6), dp(6))
+
+        sizeLabel = TextView(this)
+        sizeLabel.setTextColor(Color.BLACK)
+        sizeLabel.textSize = 15f
+        sizeLabel.text = "Text size: " + (100 + sizePct) + "%"
+        settings.addView(sizeLabel)
+
+        val seek = SeekBar(this)
+        seek.max = 120
+        seek.progress = sizePct
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                sizePct = p
+                sizeLabel.text = "Text size: " + (100 + p) + "%"
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {
+                prefs.edit().putInt("size", sizePct).apply()
+                map.setTilesScaleFactor(if (themes[themeIdx].sat) 1f else factor())
+                map.invalidate()
+            }
+        })
+        settings.addView(seek)
+
+        val themeTitle = TextView(this)
+        themeTitle.text = "Map theme"
+        themeTitle.setTextColor(Color.BLACK)
+        themeTitle.textSize = 15f
+        themeTitle.setPadding(0, dp(8), 0, 0)
+        settings.addView(themeTitle)
+
+        val group = RadioGroup(this)
+        val ids = ArrayList<Int>()
+        for ((i, t) in themes.withIndex()) {
+            val rb = RadioButton(this)
+            rb.id = View.generateViewId()
+            rb.text = t.name
+            rb.setTextColor(Color.BLACK)
+            group.addView(rb)
+            ids.add(rb.id)
+            if (i == themeIdx) rb.isChecked = true
+        }
+        group.setOnCheckedChangeListener { _, checkedId ->
+            val i = ids.indexOf(checkedId)
+            if (i >= 0 && i != themeIdx) {
+                themeIdx = i
+                prefs.edit().putInt("theme", i).apply()
+                applyTheme()
+            }
+        }
+        settings.addView(group)
+
+        val closeBtn = smallBtn("Close")
+        settings.addView(closeBtn)
+        panel.addView(settings)
 
         val pLp = FrameLayout.LayoutParams(-1, -2)
         pLp.gravity = Gravity.TOP
@@ -153,15 +287,17 @@ class MainActivity : Activity(), DropListener {
 
         // ---- Map credit ----
         val credit = TextView(this)
-        credit.text = "\u00A9 OpenStreetMap \u00A9 CARTO"
+        creditView = credit
         credit.textSize = 9f
         credit.setTextColor(Color.DKGRAY)
+        credit.setShadowLayer(3f, 0f, 0f, Color.WHITE)
         val cLp = FrameLayout.LayoutParams(-2, -2)
         cLp.gravity = Gravity.BOTTOM or Gravity.START
         cLp.setMargins(dp(4), 0, 0, dp(2))
         root.addView(credit, cLp)
 
         setContentView(root)
+        applyTheme()
 
         go.setOnClickListener { doSearch(input.text.toString()) }
         input.setOnEditorActionListener { _, actionId, _ ->
@@ -177,6 +313,12 @@ class MainActivity : Activity(), DropListener {
             }
         }
         locBtn.setOnClickListener { goToMyLocation() }
+        backBtn.setOnClickListener { clearAll() }
+        menuBtn.setOnClickListener {
+            settings.visibility = if (settings.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            if (settings.visibility == View.VISIBLE) list.visibility = View.GONE
+        }
+        closeBtn.setOnClickListener { settings.visibility = View.GONE }
         autoBtn.setOnClickListener {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
@@ -239,6 +381,43 @@ class MainActivity : Activity(), DropListener {
         } else {
             map.controller.setZoom(17.0)
             map.controller.animateTo(p)
+        }
+    }
+
+    private fun smallBtn(text: String): Button {
+        val b = Button(this)
+        b.text = text
+        b.textSize = 13f
+        b.minWidth = 0
+        b.minimumWidth = 0
+        b.setPadding(dp(10), 0, dp(10), 0)
+        return b
+    }
+
+    private fun clearAll() {
+        token++
+        autoActive = false
+        clearResult()
+        input.setText("")
+        list.visibility = View.GONE
+        status.visibility = View.GONE
+        settings.visibility = View.GONE
+        results.clear()
+        val me = myPoint()
+        if (me != null) {
+            map.controller.setZoom(16.0)
+            map.controller.animateTo(me)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (settings.visibility == View.VISIBLE) {
+            settings.visibility = View.GONE
+        } else if (destMarker != null || input.text.isNotEmpty() || list.visibility == View.VISIBLE) {
+            clearAll()
+        } else {
+            super.onBackPressed()
         }
     }
 
@@ -373,7 +552,7 @@ class MainActivity : Activity(), DropListener {
         line.outlinePaint.strokeWidth = dp(5).toFloat()
         line.outlinePaint.strokeCap = Paint.Cap.ROUND
         line.setPoints(listOf(a, b)) // straight line first (instant)
-        map.overlays.add(0, line)
+        map.overlays.add(routeIndex(), line)
         routeLine = line
         Thread {
             val pts = try { Search.route(a, b) } catch (e: Exception) { null }
