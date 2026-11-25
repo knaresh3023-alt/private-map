@@ -26,7 +26,13 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.RadioButton
 import android.widget.RadioGroup
+import android.widget.ScrollView
 import android.widget.SeekBar
+import android.graphics.Path
+import android.graphics.drawable.BitmapDrawable
+import org.osmdroid.events.MapEventsReceiver
+import org.osmdroid.views.overlay.MapEventsOverlay
+import org.osmdroid.views.overlay.gestures.RotationGestureOverlay
 import android.widget.TextView
 import android.widget.Toast
 import org.osmdroid.config.Configuration
@@ -54,8 +60,22 @@ class MainActivity : Activity(), DropListener {
     private lateinit var list: ListView
     private lateinit var status: TextView
     private lateinit var autoBtn: Button
-    private var destMarker: Marker? = null
-    private var routeLine: Polyline? = null
+    private var autoMarker: Marker? = null
+    private var autoLine: Polyline? = null
+    private var manualMarker: Marker? = null
+    private var manualLine: Polyline? = null
+    private var manualToken = 0
+    private var moveMode = 0 // 0 = move only for a new popup, 1 = never move by itself
+    private var typedText = ""
+    private var hasSaved = false
+    private lateinit var settingsBox: ScrollView
+    private lateinit var closeMarkBtn: Button
+    private val palette = intArrayOf(
+        Color.rgb(26, 115, 232), Color.rgb(245, 124, 0), Color.rgb(46, 158, 79),
+        Color.rgb(217, 48, 37), Color.rgb(142, 36, 170), Color.rgb(32, 33, 36)
+    )
+    private var manualColor = palette[1]
+    private var popupColor = palette[0]
     private val results = ArrayList<Place>()
     private var token = 0
     private var autoActive = false
@@ -149,9 +169,31 @@ class MainActivity : Activity(), DropListener {
         map.setMultiTouchControls(true)
         map.keepScreenOn = true
         map.zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
-        map.controller.setZoom(7.0)
-        map.controller.setCenter(GeoPoint(11.1271, 78.6569))
+        moveMode = prefs.getInt("move", 0)
+        manualColor = prefs.getInt("mcolor", palette[1])
+        popupColor = prefs.getInt("pcolor", palette[0])
+        val sLat = prefs.getString("lat", null)?.toDoubleOrNull()
+        val sLon = prefs.getString("lon", null)?.toDoubleOrNull()
+        val sZoom = prefs.getString("zoom", null)?.toDoubleOrNull()
+        val sRot = prefs.getString("rot", null)?.toFloatOrNull()
+        hasSaved = sLat != null && sLon != null && sZoom != null
+        map.controller.setZoom(sZoom ?: 7.0)
+        map.controller.setCenter(GeoPoint(sLat ?: 11.1271, sLon ?: 78.6569))
+        if (sRot != null) map.setMapOrientation(sRot)
         root.addView(map, FrameLayout.LayoutParams(-1, -1))
+
+        // two-finger rotate
+        val rot = RotationGestureOverlay(map)
+        rot.isEnabled = true
+        map.overlays.add(rot)
+        // long-press = mark a place
+        map.overlays.add(MapEventsOverlay(object : MapEventsReceiver {
+            override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean = false
+            override fun longPressHelper(p: GeoPoint?): Boolean {
+                if (p != null) placeMark(p)
+                return true
+            }
+        }))
 
         // ---- Blue dot ----
         myLoc = MyLocationNewOverlay(GpsMyLocationProvider(this), map)
@@ -200,7 +242,6 @@ class MainActivity : Activity(), DropListener {
         // ---- Settings (opens with the 3-line button) ----
         settings = LinearLayout(this)
         settings.orientation = LinearLayout.VERTICAL
-        settings.visibility = View.GONE
         settings.setPadding(dp(6), dp(6), dp(6), dp(6))
 
         sizeLabel = TextView(this)
@@ -225,6 +266,30 @@ class MainActivity : Activity(), DropListener {
             }
         })
         settings.addView(seek)
+
+        val moveTitle = TextView(this)
+        moveTitle.text = "Map movement"
+        moveTitle.setTextColor(Color.BLACK)
+        moveTitle.textSize = 15f
+        moveTitle.setPadding(0, dp(8), 0, 0)
+        settings.addView(moveTitle)
+        val moveGroup = RadioGroup(this)
+        val mA = RadioButton(this)
+        mA.id = View.generateViewId()
+        mA.text = "A) Move only for a new popup"
+        mA.setTextColor(Color.BLACK)
+        val mB = RadioButton(this)
+        mB.id = View.generateViewId()
+        mB.text = "B) Never move by itself"
+        mB.setTextColor(Color.BLACK)
+        moveGroup.addView(mA)
+        moveGroup.addView(mB)
+        if (moveMode == 1) mB.isChecked = true else mA.isChecked = true
+        moveGroup.setOnCheckedChangeListener { _, checkedId ->
+            moveMode = if (checkedId == mB.id) 1 else 0
+            prefs.edit().putInt("move", moveMode).apply()
+        }
+        settings.addView(moveGroup)
 
         val themeTitle = TextView(this)
         themeTitle.text = "Map theme"
@@ -254,9 +319,27 @@ class MainActivity : Activity(), DropListener {
         }
         settings.addView(group)
 
+        settings.addView(colorRow("My route / mark color", manualColor) { c ->
+            manualColor = c
+            prefs.edit().putInt("mcolor", c).apply()
+            manualLine?.outlinePaint?.color = c
+            manualMarker?.icon = pinIcon(c)
+            map.invalidate()
+        })
+        settings.addView(colorRow("Popup route color", popupColor) { c ->
+            popupColor = c
+            prefs.edit().putInt("pcolor", c).apply()
+            autoLine?.outlinePaint?.color = c
+            autoMarker?.icon = pinIcon(c)
+            map.invalidate()
+        })
+
         val closeBtn = smallBtn("Close")
         settings.addView(closeBtn)
-        panel.addView(settings)
+        settingsBox = ScrollView(this)
+        settingsBox.visibility = View.GONE
+        settingsBox.addView(settings)
+        panel.addView(settingsBox, LinearLayout.LayoutParams(-1, (resources.displayMetrics.heightPixels * 0.55).toInt()))
 
         val pLp = FrameLayout.LayoutParams(-1, -2)
         pLp.gravity = Gravity.TOP
@@ -270,6 +353,40 @@ class MainActivity : Activity(), DropListener {
         bLp.gravity = Gravity.BOTTOM or Gravity.END
         bLp.setMargins(0, 0, dp(14), dp(24))
         root.addView(locBtn, bLp)
+
+        // ---- Zoom + / - and north (compass) buttons ----
+        val side = LinearLayout(this)
+        side.orientation = LinearLayout.VERTICAL
+        val zin = smallBtn("+")
+        val zout = smallBtn("\u2212")
+        val north = smallBtn("N")
+        zin.textSize = 20f
+        zout.textSize = 20f
+        for (b in listOf(zin, zout, north)) {
+            val lp = LinearLayout.LayoutParams(dp(48), dp(48))
+            lp.setMargins(0, 0, 0, dp(6))
+            b.setPadding(0, 0, 0, 0)
+            side.addView(b, lp)
+        }
+        val sLp = FrameLayout.LayoutParams(-2, -2)
+        sLp.gravity = Gravity.END or Gravity.CENTER_VERTICAL
+        sLp.setMargins(0, 0, dp(10), 0)
+        root.addView(side, sLp)
+        zin.setOnClickListener { map.controller.zoomIn() }
+        zout.setOnClickListener { map.controller.zoomOut() }
+        north.setOnClickListener {
+            map.setMapOrientation(0f)
+            map.invalidate()
+        }
+
+        // ---- Close mark button ----
+        closeMarkBtn = smallBtn("\u2715 Close mark")
+        closeMarkBtn.visibility = View.GONE
+        val cmLp = FrameLayout.LayoutParams(-2, -2)
+        cmLp.gravity = Gravity.BOTTOM or Gravity.END
+        cmLp.setMargins(0, 0, dp(14), dp(84))
+        root.addView(closeMarkBtn, cmLp)
+        closeMarkBtn.setOnClickListener { clearManual() }
 
         // ---- Auto search OFF warning ----
         autoBtn = Button(this)
@@ -306,19 +423,15 @@ class MainActivity : Activity(), DropListener {
             } else false
         }
         list.setOnItemClickListener { _, _, pos, _ ->
-            if (pos in results.indices) {
-                token++
-                autoActive = false
-                showDestination(results[pos], false)
-            }
+            if (pos in results.indices) showManual(results[pos], true)
         }
         locBtn.setOnClickListener { goToMyLocation() }
         backBtn.setOnClickListener { clearAll() }
         menuBtn.setOnClickListener {
-            settings.visibility = if (settings.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-            if (settings.visibility == View.VISIBLE) list.visibility = View.GONE
+            settingsBox.visibility = if (settingsBox.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            if (settingsBox.visibility == View.VISIBLE) list.visibility = View.GONE
         }
-        closeBtn.setOnClickListener { settings.visibility = View.GONE }
+        closeBtn.setOnClickListener { settingsBox.visibility = View.GONE }
         autoBtn.setOnClickListener {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
@@ -345,7 +458,7 @@ class MainActivity : Activity(), DropListener {
         myLoc.enableMyLocation()
         myLoc.runOnFirstFix {
             runOnUiThread {
-                if (destMarker == null) {
+                if (!hasSaved && manualMarker == null && autoMarker == null) {
                     val p = myLoc.myLocation
                     if (p != null) {
                         map.controller.setZoom(16.0)
@@ -394,31 +507,105 @@ class MainActivity : Activity(), DropListener {
         return b
     }
 
+    // Back button: clears MY search / mark only (popup result is not touched)
     private fun clearAll() {
-        token++
-        autoActive = false
-        clearResult()
-        input.setText("")
+        clearManual()
+        if (!autoActive) input.setText("")
+        typedText = ""
         list.visibility = View.GONE
         status.visibility = View.GONE
-        settings.visibility = View.GONE
+        settingsBox.visibility = View.GONE
         results.clear()
-        val me = myPoint()
-        if (me != null) {
-            map.controller.setZoom(16.0)
-            map.controller.animateTo(me)
+        if (!autoActive) {
+            val me = myPoint()
+            if (me != null) {
+                map.controller.setZoom(16.0)
+                map.controller.animateTo(me)
+            }
         }
     }
 
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
-        if (settings.visibility == View.VISIBLE) {
-            settings.visibility = View.GONE
-        } else if (destMarker != null || input.text.isNotEmpty() || list.visibility == View.VISIBLE) {
+        if (settingsBox.visibility == View.VISIBLE) {
+            settingsBox.visibility = View.GONE
+        } else if (manualMarker != null || (!autoActive && input.text.isNotEmpty()) || list.visibility == View.VISIBLE) {
             clearAll()
         } else {
             super.onBackPressed()
         }
+    }
+
+    private fun pinIcon(color: Int): BitmapDrawable {
+        val w = dp(30)
+        val h = dp(42)
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        val r = w / 2f - 3f
+        val path = Path()
+        path.addCircle(w / 2f, w / 2f, r, Path.Direction.CW)
+        val tri = Path()
+        tri.moveTo(w * 0.15f, w * 0.68f)
+        tri.lineTo(w / 2f, h - 2f)
+        tri.lineTo(w * 0.85f, w * 0.68f)
+        tri.close()
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        p.style = Paint.Style.FILL
+        p.color = color
+        c.drawPath(path, p)
+        c.drawPath(tri, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 3f
+        p.color = Color.WHITE
+        c.drawPath(path, p)
+        c.drawPath(tri, p)
+        p.style = Paint.Style.FILL
+        c.drawCircle(w / 2f, w / 2f, w / 6f, p)
+        return BitmapDrawable(resources, bmp)
+    }
+
+    private fun colorRow(title: String, current: Int, onPick: (Int) -> Unit): LinearLayout {
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(0, dp(8), 0, 0)
+        val t = TextView(this)
+        t.text = title
+        t.setTextColor(Color.BLACK)
+        t.textSize = 15f
+        box.addView(t)
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        val btns = ArrayList<Button>()
+        var sel = current
+        fun refresh() {
+            for ((i, b) in btns.withIndex()) b.text = if (palette[i] == sel) "\u2713" else ""
+        }
+        for (c in palette) {
+            val b = Button(this)
+            val g = GradientDrawable()
+            g.setColor(c)
+            g.cornerRadius = dp(18).toFloat()
+            g.setStroke(dp(2), Color.LTGRAY)
+            b.background = g
+            b.setTextColor(Color.WHITE)
+            b.minWidth = 0
+            b.minimumWidth = 0
+            b.minHeight = 0
+            b.minimumHeight = 0
+            b.setPadding(0, 0, 0, 0)
+            val lp = LinearLayout.LayoutParams(dp(40), dp(40))
+            lp.setMargins(0, 0, dp(8), 0)
+            b.setOnClickListener {
+                sel = c
+                refresh()
+                onPick(c)
+            }
+            btns.add(b)
+            row.addView(b, lp)
+        }
+        refresh()
+        box.addView(row)
+        return box
     }
 
     private fun blueDot(): Bitmap {
@@ -440,7 +627,8 @@ class MainActivity : Activity(), DropListener {
     override fun onDrop(d: Drop) {
         token++
         val my = token
-        clearResult()
+        clearAuto()
+        if (!autoActive) typedText = input.text.toString()
         autoActive = true
         list.visibility = View.GONE
         status.visibility = View.GONE
@@ -449,29 +637,36 @@ class MainActivity : Activity(), DropListener {
         Thread {
             val place = try { Search.find(d, me) } catch (e: Exception) { null }
             runOnUiThread {
-                if (place != null && my == token) showDestination(place, true)
+                if (place != null && my == token) showAuto(place)
             }
         }.start()
     }
 
+    // popup gone: only the popup pin + line close. The map does NOT move.
     override fun onPopupGone() {
         token++
         if (!autoActive) return
         autoActive = false
-        clearResult()
-        input.setText("")
-        val me = myPoint()
-        if (me != null) {
-            map.controller.setZoom(16.0)
-            map.controller.animateTo(me)
-        }
+        clearAuto()
+        input.setText(typedText)
+        typedText = ""
     }
 
-    private fun clearResult() {
-        destMarker?.let { map.overlays.remove(it) }
-        destMarker = null
-        routeLine?.let { map.overlays.remove(it) }
-        routeLine = null
+    private fun clearAuto() {
+        autoMarker?.let { map.overlays.remove(it) }
+        autoMarker = null
+        autoLine?.let { map.overlays.remove(it) }
+        autoLine = null
+        map.invalidate()
+    }
+
+    private fun clearManual() {
+        manualToken++
+        manualMarker?.let { map.overlays.remove(it) }
+        manualMarker = null
+        manualLine?.let { map.overlays.remove(it) }
+        manualLine = null
+        closeMarkBtn.visibility = View.GONE
         map.invalidate()
     }
 
@@ -518,53 +713,89 @@ class MainActivity : Activity(), DropListener {
         list.visibility = View.VISIBLE
     }
 
-    // ---------------- Pin + route ----------------
+    // ---------------- Pins + routes ----------------
 
-    private fun showDestination(p: Place, auto: Boolean) {
-        clearResult()
-        val pos = GeoPoint(p.lat, p.lon)
+    private fun makeMarker(pos: GeoPoint, color: Int): Marker {
         val m = Marker(map)
         m.position = pos
+        m.icon = pinIcon(color)
         m.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-        if (!auto) {
-            m.title = p.title
-            m.snippet = p.sub
-        }
-        map.overlays.add(m)
-        destMarker = m
-        if (!auto) m.showInfoWindow()
-        list.visibility = View.GONE
-
-        val me = myPoint()
-        if (me != null) {
-            drawRoute(me, pos, token)
-            if (auto) fitBelowPopup(me, pos) else fitAll(me, pos)
-        } else {
-            map.controller.setZoom(if (p.approx) 14.0 else 16.0)
-            map.controller.animateTo(pos)
-        }
-        map.invalidate()
+        return m
     }
 
-    private fun drawRoute(a: GeoPoint, b: GeoPoint, my: Int) {
+    private fun makeLine(a: GeoPoint, b: GeoPoint, color: Int): Polyline {
         val line = Polyline()
-        line.outlinePaint.color = Color.rgb(26, 115, 232)
+        line.outlinePaint.color = color
         line.outlinePaint.strokeWidth = dp(5).toFloat()
         line.outlinePaint.strokeCap = Paint.Cap.ROUND
         line.setPoints(listOf(a, b)) // straight line first (instant)
         map.overlays.add(routeIndex(), line)
-        routeLine = line
+        return line
+    }
+
+    private fun fetchRoute(line: Polyline, a: GeoPoint, b: GeoPoint, valid: () -> Boolean) {
         Thread {
             val pts = try { Search.route(a, b) } catch (e: Exception) { null }
             if (pts != null) {
                 runOnUiThread {
-                    if (my == token && routeLine === line) {
+                    if (valid()) {
                         line.setPoints(pts)
                         map.invalidate()
                     }
                 }
             }
         }.start()
+    }
+
+    // Popup result (own pin + line)
+    private fun showAuto(p: Place) {
+        clearAuto()
+        val pos = GeoPoint(p.lat, p.lon)
+        val m = makeMarker(pos, popupColor)
+        map.overlays.add(m)
+        autoMarker = m
+        val me = myPoint()
+        val my = token
+        if (me != null) {
+            val line = makeLine(me, pos, popupColor)
+            autoLine = line
+            fetchRoute(line, me, pos) { my == token && autoLine === line }
+            if (moveMode == 0) fitBelowPopup(me, pos)
+        } else if (moveMode == 0) {
+            map.controller.setZoom(if (p.approx) 14.0 else 16.0)
+            map.controller.animateTo(pos)
+        }
+        map.invalidate()
+    }
+
+    // My search result or long-press mark (own pin + line). Stays until I close it.
+    private fun showManual(p: Place, moveMap: Boolean) {
+        clearManual()
+        val pos = GeoPoint(p.lat, p.lon)
+        val m = makeMarker(pos, manualColor)
+        m.title = p.title
+        m.snippet = p.sub
+        map.overlays.add(m)
+        manualMarker = m
+        closeMarkBtn.visibility = View.VISIBLE
+        list.visibility = View.GONE
+        val me = myPoint()
+        val my = manualToken
+        if (me != null) {
+            val line = makeLine(me, pos, manualColor)
+            manualLine = line
+            fetchRoute(line, me, pos) { my == manualToken && manualLine === line }
+            if (moveMap) fitAll(me, pos)
+        } else if (moveMap) {
+            map.controller.setZoom(16.0)
+            map.controller.animateTo(pos)
+        }
+        if (moveMap) m.showInfoWindow()
+        map.invalidate()
+    }
+
+    private fun placeMark(g: GeoPoint) {
+        showManual(Place("Marked place", "", g.latitude, g.longitude), false)
     }
 
     // Show both points in the LOWER half of the screen (popup covers the top)
@@ -613,6 +844,15 @@ class MainActivity : Activity(), DropListener {
     override fun onPause() {
         super.onPause()
         Bus.listener = null
+        try {
+            val c = map.mapCenter
+            getSharedPreferences("pm", Context.MODE_PRIVATE).edit()
+                .putString("lat", c.latitude.toString())
+                .putString("lon", c.longitude.toString())
+                .putString("zoom", map.zoomLevelDouble.toString())
+                .putString("rot", map.mapOrientation.toString())
+                .apply()
+        } catch (e: Exception) { }
         myLoc.disableMyLocation()
         map.onPause()
     }

@@ -9,8 +9,8 @@ android {
         applicationId = "com.naveen.privatemap"
         minSdk = 24
         targetSdk = 34
-        versionCode = 3
-        versionName = "03"
+        versionCode = 4
+        versionName = "04"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
